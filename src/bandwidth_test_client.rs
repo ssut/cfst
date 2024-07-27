@@ -7,6 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use std::{
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -28,36 +29,31 @@ impl BandwidthTestClient {
     }
 
     async fn producer(sizes: &[usize], tx_size: Sender<usize>, cancel_token: CancellationToken) {
-        let start_time = Instant::now();
         let mut current_size_index = 0;
 
-        while start_time.elapsed() < Duration::from_secs(20) {
+        loop {
             if cancel_token.is_cancelled() {
                 break;
             }
 
             let size = sizes[current_size_index];
-            tx_size.send(size).await.unwrap();
-
             let size_start_time = Instant::now();
-            let elapsed_time = size_start_time.elapsed();
+            if let Err(_) = tx_size.send(size).await {
+                break;
+            }
 
+            let elapsed_time = size_start_time.elapsed();
             if elapsed_time < Duration::from_secs(1) && current_size_index < sizes.len() - 1 {
                 current_size_index += 1;
             }
-
-            if start_time.elapsed() >= Duration::from_secs(10) {
-                break;
-            }
         }
-
-        cancel_token.cancel();
     }
 
     async fn consumer(
         http_client: &Client,
         mut rx_size: Receiver<usize>,
         tx_bytes: Sender<u64>,
+        latencies: &Arc<Mutex<Vec<f64>>>,
         cancel_token: CancellationToken,
         is_download: bool,
     ) -> Result<()> {
@@ -67,14 +63,25 @@ impl BandwidthTestClient {
             }
 
             if is_download {
+                let started_at = Instant::now();
+
                 let url = format!("https://speed.cloudflare.com/__down?bytes={}", size);
-                BandwidthTestClient::measure(
-                    http_client,
-                    &url,
-                    tx_bytes.clone(),
-                    cancel_token.clone(),
-                )
-                .await?;
+                let res = http_client.get(url).send().await?;
+                let latency = started_at.elapsed().as_micros() as f64 / 1000.0;
+                {
+                    let mut latencies = latencies.lock().unwrap();
+                    latencies.push(latency);
+                }
+
+                let mut stream = res.bytes_stream();
+                while let Some(item) = stream.next().await {
+                    let bytes = item?.len() as u64;
+                    tx_bytes.send(bytes).await?;
+
+                    if cancel_token.is_cancelled() {
+                        break;
+                    }
+                }
             } else {
                 let url = "https://speed.cloudflare.com/__up";
                 let stream = DummyVecStream::new(size, 8192, tx_bytes.clone());
@@ -84,8 +91,6 @@ impl BandwidthTestClient {
                     .body(reqwest::Body::wrap_stream(stream))
                     .send()
                     .await?;
-                let bytes = size as u64;
-                tx_bytes.send(bytes).await.unwrap();
             }
         }
 
@@ -94,6 +99,7 @@ impl BandwidthTestClient {
 
     async fn reporter(
         mut rx_bytes: Receiver<u64>,
+        latencies: &Arc<Mutex<Vec<f64>>>,
         cancel_token: CancellationToken,
         label: &str,
     ) -> Result<()> {
@@ -108,7 +114,11 @@ impl BandwidthTestClient {
         while let Some(bytes) = rx_bytes.recv().await {
             total_bytes += bytes;
 
-            let elapsed_time = start_time.elapsed().as_millis() as i32;
+            // subtract sum of latencies
+            let elapsed_time = start_time.elapsed().as_millis() as i32 - {
+                let latencies = latencies.lock().unwrap();
+                latencies.iter().sum::<f64>() as i32
+            };
             let speed = measure_speed(total_bytes, elapsed_time);
             bar.set_message(format!(
                 "{:>20}: {} Mbps",
@@ -127,44 +137,29 @@ impl BandwidthTestClient {
         }
 
         bar.finish_and_clear();
+        let elapsed_time = start_time.elapsed().as_millis() as i32 - {
+            let latencies = latencies.lock().unwrap();
+            latencies.iter().sum::<f64>() as i32
+        };
         println!(
-            "{:>20}: {:.2} Mbps (Used: {} MiB)",
+            "{:>20}: {} Mbps (Used: {} MiB)",
             label.bold(),
-            measure_speed(total_bytes, start_time.elapsed().as_millis() as i32),
+            format!("{:.2}", measure_speed(total_bytes, elapsed_time)).purple(),
             total_bytes / 1024 / 1024
         );
 
         Ok(())
     }
 
-    async fn measure(
-        http_client: &Client,
-        url: &str,
-        tx_bytes: Sender<u64>,
-        cancel_token: CancellationToken,
-    ) -> Result<()> {
-        let mut stream = http_client.get(url).send().await?.bytes_stream();
-        while let Some(item) = stream.next().await {
-            let bytes = item?.len() as u64;
-            tx_bytes.send(bytes).await?;
-
-            if cancel_token.is_cancelled() {
-                break;
-            }
-        }
-
-        Ok(())
+    pub async fn measure_download(&self, test_duration: Duration) -> Result<()> {
+        self.measure_bandwidth(test_duration, true).await
     }
 
-    pub async fn measure_download(&self) -> Result<Vec<f64>> {
-        self.measure_bandwidth(true).await
+    pub async fn measure_upload(&self, test_duration: Duration) -> Result<()> {
+        self.measure_bandwidth(test_duration, false).await
     }
 
-    pub async fn measure_upload(&self) -> Result<Vec<f64>> {
-        self.measure_bandwidth(false).await
-    }
-
-    async fn measure_bandwidth(&self, is_download: bool) -> Result<Vec<f64>> {
+    async fn measure_bandwidth(&self, test_duration: Duration, is_download: bool) -> Result<()> {
         let sizes: &[usize] = if is_download {
             &[1001000, 10001000, 25001000, 100001000] // 1MB, 10MB, 25MB, 100MB
         } else {
@@ -176,37 +171,41 @@ impl BandwidthTestClient {
             "Upload Speed"
         };
 
-        let measurements = Vec::new();
-        let (tx_size, rx_size): (Sender<usize>, Receiver<usize>) = tokio::sync::mpsc::channel(100);
+        let (tx_size, rx_size): (Sender<usize>, Receiver<usize>) = tokio::sync::mpsc::channel(1);
         let (tx_bytes, rx_bytes): (Sender<u64>, Receiver<u64>) = tokio::sync::mpsc::channel(100);
         let cancel_token = CancellationToken::new();
-        // not sure this is right
         let cancel_token_clone1 = cancel_token.clone();
         let cancel_token_clone2 = cancel_token.clone();
         let cancel_token_clone3 = cancel_token.clone();
 
+        let latencies = Arc::new(Mutex::new(Vec::new()));
+
         tokio::spawn(Self::producer(sizes, tx_size, cancel_token_clone1));
 
         let http_client = self.http_client.clone();
+        let latencies_clone1 = Arc::clone(&latencies);
         tokio::spawn(async move {
             BandwidthTestClient::consumer(
                 &http_client,
                 rx_size,
                 tx_bytes.clone(),
+                &latencies_clone1,
                 cancel_token_clone2,
                 is_download,
             )
             .await
-            .unwrap_or_else(|err| {
-                eprintln!("Error in consumer: {:?}", err);
-            });
         });
-        tokio::spawn(Self::reporter(rx_bytes, cancel_token_clone3, label));
 
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        let latencies_clone2 = Arc::clone(&latencies);
+        let reporter_task = tokio::spawn(async move {
+            Self::reporter(rx_bytes, &latencies_clone2, cancel_token_clone3, label).await
+        });
+
+        tokio::time::sleep(test_duration).await;
         cancel_token.cancel();
+        reporter_task.await?.unwrap();
 
-        Ok(measurements)
+        Ok({})
     }
 }
 

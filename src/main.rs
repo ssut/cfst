@@ -2,6 +2,8 @@ mod bandwidth_test_client;
 mod client;
 mod stats;
 mod utils;
+use std::time::Duration;
+
 use colored::*;
 
 use anyhow::Result;
@@ -39,9 +41,9 @@ async fn main() -> Result<()> {
         format!("{} (AS{})", meta.as_organization, meta.asn).blue(),
     );
 
-    client.measure_latency().await?;
-    client.measure_download().await?;
-    client.measure_upload().await?;
+    client.measure_latency(50).await?;
+    client.measure_download(Duration::from_secs(10)).await?;
+    client.measure_upload(Duration::from_secs(10)).await?;
 
     Ok(())
 }

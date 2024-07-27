@@ -144,29 +144,7 @@ impl SpeedTestClient {
         self.request(&url).await
     }
 
-    pub async fn upload(&self, bytes: usize) -> Result<RequestTiming> {
-        let url = "https://speed.cloudflare.com/__up";
-        let data = "0".repeat(bytes);
-        let start = Instant::now();
-        let res = self.http_client.post(url).body(data).send().await?;
-        let end = Instant::now();
-        let server_timing = res
-            .headers()
-            .get("server-timing")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(";dur=").nth(1))
-            .and_then(|dur| dur.parse::<f64>().ok())
-            .unwrap_or(0.0);
-
-        Ok(RequestTiming {
-            start,
-            ttfb: end, // upload ttfb is the end in this context
-            end: Some(end),
-            server_timing,
-        })
-    }
-
-    pub async fn measure_latency(&self) -> Result<Vec<f64>> {
+    pub async fn measure_latency(&self, test_count: usize) -> Result<Vec<f64>> {
         let bar = ProgressBar::new_spinner();
         bar.set_style(ProgressStyle::with_template("{msg} {spinner:.green}").unwrap());
         bar.set_message(format!(
@@ -177,7 +155,7 @@ impl SpeedTestClient {
         let mut measurements = Vec::new();
         let started_at = Instant::now();
 
-        for _ in 0..100 {
+        for _ in 0..test_count {
             let timing = self.download(0).await?;
             measurements.push(
                 (timing.ttfb - timing.start).as_micros() as f64 - timing.server_timing * 1000.0,
@@ -196,6 +174,7 @@ impl SpeedTestClient {
             ));
             bar.tick();
 
+            // max up to 5 secs (with at least 30 measurements)
             if measurements.len() >= 30 && started_at.elapsed() > Duration::from_secs(5) {
                 break;
             }
@@ -218,11 +197,15 @@ impl SpeedTestClient {
         Ok(measurements)
     }
 
-    pub async fn measure_download(&self) -> Result<Vec<f64>> {
-        self.bandwidth_test_client.measure_download().await
+    pub async fn measure_download(&self, test_duration: Duration) -> Result<()> {
+        self.bandwidth_test_client
+            .measure_download(test_duration)
+            .await
     }
 
-    pub async fn measure_upload(&self) -> Result<Vec<f64>> {
-        self.bandwidth_test_client.measure_upload().await
+    pub async fn measure_upload(&self, test_duration: Duration) -> Result<()> {
+        self.bandwidth_test_client
+            .measure_upload(test_duration)
+            .await
     }
 }
